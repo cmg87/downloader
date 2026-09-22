@@ -19,6 +19,24 @@ command -v ffmpeg && ffmpeg -version
 
 The app deliberately does not install or bundle either binary.
 
+### Threads support
+
+Public Threads video posts are supported through the third-party [`yt-dlp-threads`](https://github.com/tribixbite/yt-dlp-threads) extractor plugin. On this desktop it is installed in yt-dlp's user plugin directory:
+
+```text
+$HOME/.config/yt-dlp/plugins/yt-dlp-threads/yt_dlp_plugins/extractor/threads.py
+```
+
+The plugin supports public `threads.com` and `threads.net` post, share, and multi-video URLs. Private, login-gated, image-only, and text-only posts are not supported. Because extraction depends on Threads' server-rendered crawler metadata, a future Threads layout change may require updating the plugin.
+
+To verify discovery:
+
+```bash
+yt-dlp --verbose --simulate "https://www.threads.com/@user/post/POST_ID"
+```
+
+The debug output should include `Extractor Plugins: ThreadsIE`.
+
 ## Run locally
 
 ```bash

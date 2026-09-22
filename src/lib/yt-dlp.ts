@@ -52,6 +52,7 @@ function sourceLabel(extractor: string): string {
     soundcloud: "SoundCloud",
     reddit: "Reddit",
     twitch: "Twitch",
+    threads: "Threads",
     generic: "Web",
   };
 
