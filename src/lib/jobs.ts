@@ -1,26 +1,48 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
-import type {
-  AudioFormat,
-  CreateJobInput,
-  DownloadJob,
-  DownloadQuality,
-  VideoFormat,
-} from "@/lib/types";
-import { classifyYtDlpError } from "@/lib/yt-dlp";
+import type { CreateJobInput, DownloadJob } from "@/lib/types";
+import {
+  buildYtDlpArgs,
+  outputTemplateFor,
+  sanitizeFileSegment,
+} from "@/lib/download-args";
+import { classifyYtDlpError, errorKindOf, YtDlpError } from "@/lib/yt-dlp";
+import { getXMedia, xPostId } from "@/lib/x-fallback";
+import { renderPostImage } from "@/lib/post-render";
+import type { PostOptions } from "@/lib/post-options";
+import { getXPost } from "@/lib/x-post";
+import { instagramRequest } from "@/lib/instagram/client";
+import type { InstagramJobInput } from "@/lib/instagram/types";
 
 const TEMP_ROOT = join(tmpdir(), "media-downloader");
-const SERVER_OUTPUT_DIR = join(homedir(), "Videos", "Downloader");
+/**
+ * Where "Save / This PC" writes permanent copies. Defaults to
+ * `$HOME/Videos/Downloader`; set `MEDIA_DOWNLOADER_SAVE_DIR` to an absolute
+ * path to redirect PC saves (used by tests and by operators who keep media
+ * elsewhere). A relative or empty value is ignored so a bad setting can never
+ * silently scatter files into the server's working directory.
+ */
+const SERVER_OUTPUT_DIR =
+  absoluteSaveDir(process.env.MEDIA_DOWNLOADER_SAVE_DIR) ??
+  join(homedir(), "Videos", "Downloader");
+
+/** Accept only an absolute, non-empty override for the PC save directory. */
+function absoluteSaveDir(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed && isAbsolute(trimmed) ? trimmed : undefined;
+}
 const DOWNLOAD_TTL_MS = 6 * 60 * 60 * 1_000;
 const COMPLETED_JOB_TTL_MS = 24 * 60 * 60 * 1_000;
 const LOG_LIMIT = 8_000;
 
 interface InternalDownloadJob extends DownloadJob {
-  input: CreateJobInput;
+  input?: CreateJobInput;
+  copyInput?: { url: string; options: PostOptions };
+  instagramInput?: InstagramJobInput;
   filePath?: string;
   cleanupScheduled?: boolean;
 }
@@ -47,6 +69,7 @@ function publicJob(job: InternalDownloadJob): DownloadJob {
     filename,
     savedPath,
     error,
+    errorKind,
     details,
     destination,
     createdAt,
@@ -62,6 +85,7 @@ function publicJob(job: InternalDownloadJob): DownloadJob {
     filename,
     savedPath,
     error,
+    errorKind,
     details: status === "error" ? details : undefined,
     destination,
     createdAt,
@@ -96,10 +120,55 @@ export function createDownloadJob(input: CreateJobInput): DownloadJob {
   return publicJob(job);
 }
 
+export function createCopyXJob(url: string, options: PostOptions, destination: DownloadJob["destination"]): DownloadJob {
+  pruneExpiredJobs();
+  const id = randomUUID();
+  const timestamp = now();
+  const job: InternalDownloadJob = {
+    id,
+    status: "queued",
+    destination,
+    copyInput: { url, options },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  jobs.set(id, job);
+  setImmediate(() => void runCopyXJob(job));
+  return publicJob(job);
+}
+
 export function getDownloadJob(id: string): DownloadJob | undefined {
   pruneExpiredJobs();
   const job = jobs.get(id);
   return job ? publicJob(job) : undefined;
+}
+
+export function createInstagramJob(input: InstagramJobInput, destination: DownloadJob["destination"]): DownloadJob {
+  pruneExpiredJobs();
+  const timestamp = now();
+  const job: InternalDownloadJob = { id: randomUUID(), status: "queued", destination, instagramInput: input, createdAt: timestamp, updatedAt: timestamp };
+  jobs.set(job.id, job);
+  setImmediate(() => void runInstagramJob(job));
+  return publicJob(job);
+}
+
+async function runInstagramJob(job: InternalDownloadJob) {
+  const jobDir = join(TEMP_ROOT, job.id);
+  const outputDir = job.destination === "download" ? jobDir : SERVER_OUTPUT_DIR;
+  try {
+    await mkdir(jobDir, { recursive: true });
+    updateJob(job, { status: "downloading" });
+    const result = await instagramRequest<{ filePath: string }>("download", { ...job.instagramInput, outputDir, stagingDir: join(jobDir, "items") });
+    const fileInfo = await stat(result.filePath);
+    if (!fileInfo.isFile() || !fileInfo.size || dirname(result.filePath) !== outputDir) throw new Error("Instagram produced an invalid output file.");
+    updateJob(job, { status: "complete", progress: 100, filePath: result.filePath, filename: basename(result.filePath), savedPath: job.destination === "server" ? result.filePath : undefined });
+  } catch (error) {
+    updateJob(job, { status: "error", error: error instanceof Error ? error.message : "Instagram download failed." });
+    if (job.destination === "download") await rm(jobDir, { recursive: true, force: true }).catch(() => undefined);
+  } finally {
+    if (job.destination === "server") await rm(jobDir, { recursive: true, force: true }).catch(() => undefined);
+    scheduleExpiry(job);
+  }
 }
 
 export function getInternalDownloadJob(id: string): InternalDownloadJob | undefined {
@@ -120,6 +189,8 @@ export function scheduleRetrievedFileCleanup(job: InternalDownloadJob) {
 }
 
 async function runJob(job: InternalDownloadJob) {
+  const input = job.input;
+  if (!input) return;
   const jobDir = join(TEMP_ROOT, job.id);
   const outputDir =
     job.destination === "download" ? jobDir : SERVER_OUTPUT_DIR;
@@ -128,21 +199,45 @@ async function runJob(job: InternalDownloadJob) {
     await mkdir(outputDir, { recursive: true });
     updateJob(job, { status: "downloading", progress: 0 });
 
-    const outputTemplate = join(
-      outputDir,
-      "%(title)s [%(id)s].%(ext)s",
-    );
-    const args = buildYtDlpArgs(job.input, outputTemplate);
-    const filePath = await spawnDownload(job, args);
+    const outputTemplate = outputTemplateFor(outputDir);
+    const args = buildYtDlpArgs(input, outputTemplate);
+    let filePath: string | undefined;
+    try {
+      filePath = await spawnDownload(job, args);
+    } catch (originalError) {
+      if (!xPostId(input.url) || input.format === "webm") throw originalError;
+      let items;
+      try { items = await getXMedia(input.url); } catch { throw originalError; }
+      const selected = items[input.itemIndex ? input.itemIndex - 1 : 0];
+      if (!selected) throw originalError;
+      if (input.type === "audio" && !selected.hasAudio) {
+        throw new Error("This X video has no usable audio track.");
+      }
+      const height = typeof input.quality === "number" ? input.quality : Infinity;
+      const variant = selected.variants.find((item) => item.height <= height)
+        ?? selected.variants.at(-1);
+      if (!variant) throw originalError;
+      const safeTitle = sanitizeFileSegment(selected.title) || "X video";
+      const fallbackTemplate = join(outputDir, `${safeTitle} [${selected.id}-${selected.index}].%(ext)s`);
+      const fallbackInput = { ...input, url: variant.url, quality: "best" as const, itemIndex: undefined };
+      updateJob(job, { status: "downloading", progress: 0, details: undefined });
+      filePath = await spawnDownload(job, buildYtDlpArgs(fallbackInput, fallbackTemplate));
+    }
     const resolvedPath = filePath ?? (await findOutputFile(jobDir));
 
     if (!resolvedPath) {
-      throw new Error("yt-dlp finished, but the output file could not be located.");
+      throw new YtDlpError(
+        "output",
+        "yt-dlp finished, but the output file could not be located.",
+      );
     }
 
     const fileInfo = await stat(resolvedPath);
     if (!fileInfo.isFile() || fileInfo.size === 0) {
-      throw new Error("yt-dlp produced an empty or invalid output file.");
+      throw new YtDlpError(
+        "output",
+        "yt-dlp produced an empty or invalid output file.",
+      );
     }
 
     updateJob(job, {
@@ -170,6 +265,7 @@ async function runJob(job: InternalDownloadJob) {
     updateJob(job, {
       status: "error",
       error: friendly.message,
+      errorKind: errorKindOf(friendly),
       details,
       speed: undefined,
       eta: undefined,
@@ -182,66 +278,112 @@ async function runJob(job: InternalDownloadJob) {
   }
 }
 
-function buildYtDlpArgs(input: CreateJobInput, outputTemplate: string): string[] {
-  const args = [
-    "--ignore-config",
-    "--no-playlist",
-    "--no-colors",
-    "--newline",
-    "--trim-filenames",
-    "180",
-    "--progress-template",
-    "download:__PROGRESS__%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
-    "--print",
-    "after_move:__FILE__%(filepath)s",
-    "--output",
-    outputTemplate,
-  ];
-
-  if (input.type === "audio") {
-    args.push(
-      "--extract-audio",
-      "--audio-format",
-      input.format as AudioFormat,
-      "--audio-quality",
-      "0",
-    );
-  } else {
-    const format = input.format as VideoFormat;
-    args.push("--format", videoSelector(input.quality ?? "best", format));
-    args.push("--merge-output-format", format, "--remux-video", format);
+async function runCopyXJob(job: InternalDownloadJob) {
+  const input = job.copyInput;
+  if (!input) return;
+  const jobDir = join(TEMP_ROOT, job.id);
+  const outputDir = job.destination === "download" ? jobDir : SERVER_OUTPUT_DIR;
+  let outputPath: string | undefined;
+  try {
+    await mkdir(jobDir, { recursive: true });
+    await mkdir(outputDir, { recursive: true });
+    updateJob(job, { status: "processing", progress: 0 });
+    const post = await getXPost(input.url);
+    const rendered = await renderPostImage(post, input.options);
+    const safeHandle = post.handle.replace(/[^A-Za-z0-9_]/g, "").slice(0, 30) || "post";
+    const name = `X post @${safeHandle} [${post.id}] [${input.options.ratio.replace(":", "x")}-${job.id.slice(0, 8)}].${input.options.output}`;
+    outputPath = join(outputDir, name);
+    if (input.options.output === "png") {
+      await writeFile(outputPath, rendered.png);
+    } else {
+      const framePath = join(jobDir, "frame.png");
+      await writeFile(framePath, rendered.png);
+      const video = rendered.video;
+      const playing = video && rendered.slot;
+      const duration = playing ? Math.max(1, video.duration ?? input.options.seconds) : input.options.seconds;
+      await spawnComposition(job, framePath, outputPath, input.options, playing ? video.videoUrl : undefined, rendered.slot, duration);
+    }
+    const fileInfo = await stat(/* turbopackIgnore: true */ outputPath);
+    if (!fileInfo.isFile() || fileInfo.size === 0) throw new Error("The composed post file is empty.");
+    updateJob(job, {
+      status: "complete",
+      progress: 100,
+      filePath: outputPath,
+      filename: name,
+      savedPath: job.destination === "server" ? outputPath : undefined,
+    });
+    scheduleExpiry(job);
+  } catch (error) {
+    if (outputPath) await rm(outputPath, { force: true }).catch(() => undefined);
+    updateJob(job, {
+      status: "error",
+      error: error instanceof Error ? error.message : "Could not compose this X post.",
+      details: undefined,
+    });
+    if (job.destination === "download") {
+      await rm(jobDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+    scheduleExpiry(job);
+  } finally {
+    if (job.destination === "server") {
+      await rm(jobDir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
-
-  args.push("--", input.url);
-  return args;
 }
 
-function videoSelector(quality: DownloadQuality, format: VideoFormat): string {
-  const height = typeof quality === "number" ? `[height<=${quality}]` : "";
-
-  if (format === "mp4") {
-    return [
-      `bestvideo${height}[ext=mp4]+bestaudio[ext=m4a]`,
-      `best${height}[ext=mp4]`,
-      `bestvideo${height}+bestaudio`,
-      `best${height}`,
-      "best",
-    ].join("/");
-  }
-
-  if (format === "webm") {
-    return [
-      `bestvideo${height}[ext=webm]+bestaudio[ext=webm]`,
-      `best${height}[ext=webm]`,
-    ].join("/");
-  }
-
-  return [
-    `bestvideo${height}+bestaudio`,
-    `best${height}`,
-    "best",
-  ].join("/");
+function spawnComposition(
+  job: InternalDownloadJob,
+  framePath: string,
+  outputPath: string,
+  options: PostOptions,
+  videoUrl: string | undefined,
+  slot: { x: number; y: number; width: number; height: number } | undefined,
+  duration: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const fade = options.animation === "fade" ? ",fade=t=in:st=0:d=0.55" : "";
+    const args = ["-hide_banner", "-loglevel", "error", "-y", "-loop", "1", "-framerate", "30", "-i", framePath];
+    if (videoUrl && slot) {
+      // Avoid leaving a job stuck forever if X's media CDN stops responding.
+      args.push("-rw_timeout", "20000000", "-i", videoUrl);
+      args.push(
+        "-filter_complex",
+        `[1:v]scale=${slot.width}:${slot.height}:force_original_aspect_ratio=decrease,pad=${slot.width}:${slot.height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1[clip];[0:v][clip]overlay=${slot.x}:${slot.y}${fade},format=yuv420p[v]`,
+        "-map", "[v]", "-map", "1:a?",
+      );
+    } else {
+      args.push("-vf", `format=yuv420p${fade}`);
+    }
+    args.push("-t", String(duration), "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", outputPath);
+    const child = spawn("ffmpeg", args, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    let stdout = "";
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error); else resolve();
+    };
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      const lines = stdout.split(/\r?\n/);
+      stdout = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.startsWith("out_time_ms=")) continue;
+        const micros = Number(line.slice("out_time_ms=".length));
+        if (Number.isFinite(micros)) updateJob(job, { progress: Math.min(99, Math.round(micros / (duration * 10_000))) });
+      }
+    });
+    child.stderr.on("data", (chunk: string) => { stderr = (stderr + chunk).slice(-LOG_LIMIT); });
+    child.on("error", (error) => finish(new Error(error.message)));
+    child.on("close", (code) => finish(code === 0 ? undefined : new Error(`ffmpeg could not compose this post. ${cleanDetails(stderr).slice(-500)}`)));
+  });
 }
+
+// yt-dlp argument construction and filename policy live in
+// `src/lib/download-args.ts` (pure + unit-tested).
 
 function spawnDownload(
   job: InternalDownloadJob,
@@ -286,6 +428,19 @@ function spawnDownload(
 
       if (trimmed.startsWith("__FILE__")) {
         outputPath = trimmed.slice("__FILE__".length).trim();
+        return;
+      }
+
+      // `--no-overwrites` makes yt-dlp skip an existing file instead of
+      // clobbering it; it then reports the surviving path here. Capture that
+      // path so a re-download still resolves to a real, non-destructive file.
+      if (/\bhas already been downloaded\b/i.test(trimmed)) {
+        const candidate = trimmed
+          .replace(/^\[[^\]]+\]\s*/, "")
+          .replace(/\s*has already been downloaded.*$/i, "")
+          .trim();
+        if (candidate) outputPath = candidate;
+        updateJob(job, { status: "processing", progress: 100 });
         return;
       }
 

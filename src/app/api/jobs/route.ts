@@ -14,7 +14,7 @@ export const dynamic = "force-dynamic";
 const videoFormats = new Set<VideoFormat>(["mp4", "mkv", "webm"]);
 const audioFormats = new Set<AudioFormat>(["m4a", "mp3", "opus"]);
 const destinations = new Set<DownloadDestination>(["download", "server"]);
-const types = new Set<DownloadType>(["video", "audio"]);
+const types = new Set<DownloadType>(["video", "audio", "image"]);
 
 export async function POST(request: Request) {
   try {
@@ -22,7 +22,7 @@ export async function POST(request: Request) {
     const url = validateMediaUrl(body.url);
 
     if (!types.has(body.type as DownloadType)) {
-      throw new Error("Choose video or audio only.");
+      throw new Error("Choose video, audio, or image only.");
     }
     if (!destinations.has(body.destination as DownloadDestination)) {
       throw new Error("Choose Download or Save.");
@@ -35,6 +35,9 @@ export async function POST(request: Request) {
     }
     if (type === "audio" && !audioFormats.has(format as AudioFormat)) {
       throw new Error("Choose M4A, MP3, or Opus for audio.");
+    }
+    if (type === "image" && format !== "original") {
+      throw new Error("Images keep their original format.");
     }
 
     let quality: CreateJobInput["quality"];
@@ -53,12 +56,21 @@ export async function POST(request: Request) {
       }
     }
 
+    let itemIndex: number | undefined;
+    if (body.itemIndex !== undefined) {
+      if (typeof body.itemIndex !== "number" || !Number.isInteger(body.itemIndex) || body.itemIndex < 1 || body.itemIndex > 20) {
+        throw new Error("Choose a valid video from this post.");
+      }
+      itemIndex = body.itemIndex;
+    }
+
     const job = createDownloadJob({
       url,
       type,
       quality,
       format: format as CreateJobInput["format"],
       destination: body.destination as DownloadDestination,
+      itemIndex,
     });
 
     return Response.json(job, { status: 202 });

@@ -4,12 +4,15 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 43827",
-    "build": "next build",
+    "build": "next build --webpack",
     "start": "next start -p 43827",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test": "node --import ./test/alias-hooks.mjs --test test/*.test.ts",
+    "test:instagram": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=test/fixtures/instagram python3 test/instagram-worker.test.py"
   },
   "dependencies": {
     "next": "16.3.5",
+    "playwright-core": "^1.63.0",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },

@@ -1,6 +1,17 @@
 import { spawn } from "node:child_process";
 
+import { classifyYtDlpError } from "@/lib/error-kind";
 import type { MediaCapabilities } from "@/lib/types";
+import { isImageExtension } from "@/lib/download-args";
+import { getXMedia, xCapabilities, xPostId } from "@/lib/x-fallback";
+
+export {
+  YtDlpError,
+  classifyYtDlpError,
+  classifyYtDlpErrorKind,
+  errorKindOf,
+  ytDlpErrorMessage,
+} from "@/lib/error-kind";
 
 const INSPECTION_TIMEOUT_MS = 90_000;
 const MAX_METADATA_BYTES = 25 * 1024 * 1024;
@@ -16,6 +27,7 @@ interface YtDlpFormat {
 }
 
 interface YtDlpMetadata {
+  entries?: unknown;
   title?: unknown;
   uploader?: unknown;
   channel?: unknown;
@@ -58,6 +70,13 @@ function sourceLabel(extractor: string): string {
 
   if (labels[key]) return labels[key];
 
+  // yt-dlp's `extractor_key` is the class name minus its `IE` suffix (e.g.
+  // "Threads", "Youtube"), while the friendly labels above
+  // are keyed by product. Match a known product as a prefix so sub
+  // extractors render with the product’s familiar name.
+  const product = Object.keys(labels).find((name) => key.startsWith(name));
+  if (product) return labels[product];
+
   return key
     .replace(/[_-]+/g, " ")
     .replace(/\b\w/g, (letter) => letter.toUpperCase()) || "Web";
@@ -79,6 +98,12 @@ function normalizeMetadata(raw: YtDlpMetadata): MediaCapabilities {
   );
   const audioFormats = formats.filter(
     (format) => isCodec(format.acodec) || hasMediaExtension(format.audio_ext),
+  );
+  const imageFormats = formats.filter(
+    (format) =>
+      isImageExtension(cleanString(format.ext)) &&
+      !isCodec(format.vcodec) &&
+      !hasMediaExtension(format.video_ext),
   );
   const resolutions = Array.from(
     new Set(
@@ -122,10 +147,14 @@ function normalizeMetadata(raw: YtDlpMetadata): MediaCapabilities {
     resolutions,
     videoContainers: containers(videoFormats),
     audioContainers: containers(audioFormats),
+    hasImage: imageFormats.length > 0,
+    imageContainers: containers(imageFormats),
   };
 }
 
-export async function inspectMedia(url: string): Promise<MediaCapabilities> {
+export async function inspectMedia(
+  url: string,
+): Promise<MediaCapabilities> {
   const args = [
     "--ignore-config",
     "--dump-single-json",
@@ -139,7 +168,18 @@ export async function inspectMedia(url: string): Promise<MediaCapabilities> {
     url,
   ];
 
-  const { stdout } = await collectProcess("yt-dlp", args);
+  let stdout: string;
+  try {
+    ({ stdout } = await collectProcess("yt-dlp", args));
+  } catch (error) {
+    if (xPostId(url)) {
+      try {
+        const items = await getXMedia(url);
+        if (items.length) return xCapabilities(items);
+      } catch { /* The original yt-dlp error is more useful. */ }
+    }
+    throw error;
+  }
 
   let metadata: YtDlpMetadata;
   try {
@@ -148,7 +188,26 @@ export async function inspectMedia(url: string): Promise<MediaCapabilities> {
     throw new Error("yt-dlp returned metadata in an unexpected format.");
   }
 
-  return normalizeMetadata(metadata);
+  if (Array.isArray(metadata.entries) && metadata.entries.length > 0) {
+    const items = metadata.entries
+      .filter((entry): entry is YtDlpMetadata => Boolean(entry && typeof entry === "object"))
+      .flatMap((entry) => {
+        try { return [normalizeMetadata(entry)]; } catch { return []; }
+      });
+    if (items.length) return { ...items[0], ...(items.length > 1 ? { items } : {}) };
+  }
+
+  try {
+    return normalizeMetadata(metadata);
+  } catch (error) {
+    if (xPostId(url)) {
+      try {
+        const items = await getXMedia(url);
+        if (items.length) return xCapabilities(items);
+      } catch { /* Preserve the original error. */ }
+    }
+    throw error;
+  }
 }
 
 function collectProcess(
@@ -215,38 +274,4 @@ function collectProcess(
       }
     });
   });
-}
-
-export function classifyYtDlpError(stderr: string): Error {
-  const message = stderr.toLowerCase();
-
-  if (message.includes("unsupported url") || message.includes("no suitable extractor")) {
-    return new Error("This URL is not supported by yt-dlp.");
-  }
-  if (
-    message.includes("sign in") ||
-    message.includes("login required") ||
-    message.includes("cookies") ||
-    message.includes("authentication")
-  ) {
-    return new Error("This media requires a login or browser cookies.");
-  }
-  if (message.includes("private video") || message.includes("private content")) {
-    return new Error("This media is private and cannot be downloaded.");
-  }
-  if (
-    message.includes("video unavailable") ||
-    message.includes("has been removed") ||
-    message.includes("deleted")
-  ) {
-    return new Error("This media is unavailable or has been deleted.");
-  }
-  if (message.includes("no video formats") || message.includes("requested format is not available")) {
-    return new Error("No usable formats were found for this media.");
-  }
-  if (message.includes("ffmpeg") && (message.includes("not found") || message.includes("error"))) {
-    return new Error("ffmpeg could not process the selected format.");
-  }
-
-  return new Error("yt-dlp could not inspect this URL.");
 }

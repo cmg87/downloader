@@ -25,5 +25,10 @@ export function validateMediaUrl(value: unknown): string {
     throw new Error("URLs containing embedded usernames or passwords are not supported.");
   }
 
+  if (/(^|\.)instagram\.com\.?$/i.test(parsed.hostname) &&
+      /^\/stories(?:\/|$)/i.test(decodeURIComponent(parsed.pathname))) {
+    throw new Error("Use the Instagram tab for current stories.");
+  }
+
   return parsed.toString();
 }

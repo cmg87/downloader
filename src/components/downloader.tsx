@@ -9,17 +9,20 @@ import type {
   DownloadFormat,
   DownloadJob,
   DownloadQuality,
+  JobErrorKind,
   MediaCapabilities,
   VideoFormat,
 } from "@/lib/types";
 
 type Selection =
   | { type: "video"; quality: DownloadQuality }
-  | { type: "audio"; quality?: never };
+  | { type: "audio"; quality?: never }
+  | { type: "image"; quality?: never };
 
 interface ApiError {
   error?: string;
   details?: string;
+  errorKind?: JobErrorKind;
 }
 
 const videoFormats: VideoFormat[] = ["mp4", "mkv", "webm"];
@@ -30,6 +33,7 @@ export function Downloader() {
   const [inspecting, setInspecting] = useState(false);
   const [inspectError, setInspectError] = useState<string>();
   const [media, setMedia] = useState<MediaCapabilities>();
+  const [mediaItemIndex, setMediaItemIndex] = useState(0);
   const [selection, setSelection] = useState<Selection>({
     type: "video",
     quality: "best",
@@ -111,12 +115,18 @@ export function Downloader() {
         body: JSON.stringify({ url }),
       });
       const data = (await response.json()) as MediaCapabilities & ApiError;
-      if (!response.ok) throw new Error(data.error ?? "Could not inspect this URL.");
+      if (!response.ok) {
+        throw new Error(data.error ?? "Could not inspect this URL.");
+      }
 
       setMedia(data);
+      setMediaItemIndex(0);
       if (data.hasVideo) {
         setSelection({ type: "video", quality: "best" });
         setFormat("mp4");
+      } else if (data.hasImage) {
+        setSelection({ type: "image" });
+        setFormat("original");
       } else {
         setSelection({ type: "audio" });
         setFormat("m4a");
@@ -145,6 +155,8 @@ export function Downloader() {
     setJobRequestError(undefined);
     if (next.type === "audio") {
       setFormat("m4a");
+    } else if (next.type === "image") {
+      setFormat("original");
     } else if (!videoFormats.includes(format as VideoFormat)) {
       setFormat("mp4");
     }
@@ -167,6 +179,7 @@ export function Downloader() {
           quality: selection.type === "video" ? selection.quality : undefined,
           format,
           destination,
+          itemIndex: media.items?.length ? mediaItemIndex + 1 : undefined,
         }),
       });
       const data = (await response.json()) as DownloadJob & ApiError;
@@ -177,18 +190,24 @@ export function Downloader() {
     }
   }
 
-  const availableVideoFormats = media
+  const activeMedia = media?.items?.[mediaItemIndex] ?? media;
+  const availableVideoFormats = activeMedia
     ? videoFormats.filter(
-        (item) => item !== "webm" || media.videoContainers.includes("webm"),
+        (item) => item !== "webm" || activeMedia.videoContainers.includes("webm"),
       )
     : videoFormats;
-  const currentFormats = selection.type === "video" ? availableVideoFormats : audioFormats;
+  const currentFormats: DownloadFormat[] =
+    selection.type === "video"
+      ? availableVideoFormats
+      : selection.type === "image"
+        ? ["original"]
+        : audioFormats;
 
   return (
     <div className={`app-frame ${media ? "has-result" : ""}`}>
       <header className="brand-block">
         <div className="brand-mark" aria-hidden="true">
-          <DownloadIcon />
+          <Image src="/icons/app-mark.png" alt="" width={48} height={48} preload />
         </div>
         <div>
           <p className="eyebrow">Private utility</p>
@@ -219,26 +238,44 @@ export function Downloader() {
           disabled={inspecting || !url.trim()}
           aria-label={inspecting ? "Inspecting link" : "Inspect link"}
         >
-          {inspecting ? <Spinner /> : <ArrowIcon />}
+          {inspecting ? (
+            <Spinner />
+          ) : (
+            <Image src="/icons/inspect.png" alt="" width={26} height={26} />
+          )}
         </button>
       </form>
 
       {inspectError && <ErrorNotice message={inspectError} />}
 
-      {!media && !inspectError && (
-        <div className="empty-copy" aria-hidden={inspecting}>
-          <span className="pulse-dot" />
-          <p>Paste a URL to see exactly what’s available.</p>
-        </div>
-      )}
-
-      {media && (
-        <section className="media-card" aria-label={`Download options for ${media.title}`}>
-          <MediaHeader media={media} />
+      {media && activeMedia && (
+        <section className="media-card" aria-label={`Download options for ${activeMedia.title}`}>
+          <MediaHeader media={activeMedia} />
 
           <div className="options-panel">
+            {media.items && media.items.length > 1 && (
+              <OptionGroup label="Item in this post">
+                {media.items.map((item, index) => (
+                  <ChoiceButton key={index} active={mediaItemIndex === index} onClick={() => {
+                    setMediaItemIndex(index);
+                    setSelection(
+                      item.hasVideo
+                        ? { type: "video", quality: "best" }
+                        : item.hasImage
+                          ? { type: "image" }
+                          : { type: "audio" },
+                    );
+                    setFormat(item.hasVideo ? "mp4" : item.hasImage ? "original" : "m4a");
+                    setJob(undefined);
+                    setJobRequestError(undefined);
+                  }}>
+                    {item.hasVideo ? "Video" : item.hasImage ? "Image" : "Audio"} {index + 1}
+                  </ChoiceButton>
+                ))}
+              </OptionGroup>
+            )}
             <OptionGroup label="Choose what to save">
-              {media.hasVideo && (
+              {activeMedia.hasVideo && (
                 <>
                   <ChoiceButton
                     active={selection.type === "video" && selection.quality === "best"}
@@ -246,7 +283,7 @@ export function Downloader() {
                   >
                     Best
                   </ChoiceButton>
-                  {media.resolutions.map((height) => (
+                  {activeMedia.resolutions.map((height) => (
                     <ChoiceButton
                       key={height}
                       active={selection.type === "video" && selection.quality === height}
@@ -257,13 +294,29 @@ export function Downloader() {
                   ))}
                 </>
               )}
-              {media.hasAudio && (
+              {activeMedia.hasImage && (
+                <ChoiceButton
+                  active={selection.type === "image"}
+                  onClick={() => chooseSelection({ type: "image" })}
+                  wide
+                >
+                  <span className="choice-icon" aria-hidden="true">🖼</span>
+                  Image ({activeMedia.imageContainers?.[0]?.toUpperCase() ?? "original"})
+                </ChoiceButton>
+              )}
+              {activeMedia.hasAudio && (
                 <ChoiceButton
                   active={selection.type === "audio"}
                   onClick={() => chooseSelection({ type: "audio" })}
                   wide
                 >
-                  <AudioIcon />
+                  <Image
+                    className="choice-icon"
+                    src="/icons/audio-only.png"
+                    alt=""
+                    width={20}
+                    height={20}
+                  />
                   Audio only
                 </ChoiceButton>
               )}
@@ -292,7 +345,13 @@ export function Downloader() {
                 onClick={() => createJob("server")}
                 disabled={jobIsActive}
               >
-                <SaveIcon />
+                <Image
+                  className="action-icon"
+                  src="/icons/save-pc.png"
+                  alt=""
+                  width={30}
+                  height={30}
+                />
                 <span>
                   <strong>Save</strong>
                   <small>This PC</small>
@@ -304,7 +363,13 @@ export function Downloader() {
                 onClick={() => createJob("download")}
                 disabled={jobIsActive}
               >
-                <DownloadIcon />
+                <Image
+                  className="action-icon"
+                  src="/icons/download-device.png"
+                  alt=""
+                  width={30}
+                  height={30}
+                />
                 <span>
                   <strong>Download</strong>
                   <small>This device</small>
@@ -318,13 +383,6 @@ export function Downloader() {
         </section>
       )}
 
-      <footer>
-        <span>yt-dlp</span>
-        <i />
-        <span>ffmpeg</span>
-        <i />
-        <span>files stay yours</span>
-      </footer>
     </div>
   );
 }
@@ -361,7 +419,9 @@ function MediaHeader({ media }: { media: MediaCapabilities }) {
             ? media.resolutions.length > 0
               ? `${media.resolutions.length} video qualities`
               : "Video available"
-            : "Audio"}
+            : media.hasImage
+              ? "Image available"
+              : "Audio"}
           {media.hasVideo && media.hasAudio ? " · audio available" : ""}
         </p>
       </div>
@@ -401,7 +461,7 @@ function ChoiceButton({
   );
 }
 
-function JobProgress({ job }: { job: DownloadJob }) {
+export function JobProgress({ job }: { job: DownloadJob }) {
   const statusLabel = {
     queued: "Getting ready",
     downloading: "Downloading",
@@ -462,7 +522,7 @@ function JobProgress({ job }: { job: DownloadJob }) {
   );
 }
 
-function ErrorNotice({ message }: { message: string }) {
+export function ErrorNotice({ message }: { message: string }) {
   return (
     <div className="error-notice" role="alert">
       <span aria-hidden="true">!</span>
@@ -485,38 +545,6 @@ function formatDuration(totalSeconds: number): string {
   return hours > 0
     ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
     : `${minutes}:${String(remainder).padStart(2, "0")}`;
-}
-
-function ArrowIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M5 12h14M13 6l6 6-6 6" />
-    </svg>
-  );
-}
-
-function DownloadIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M12 3v12m0 0 5-5m-5 5-5-5M5 20h14" />
-    </svg>
-  );
-}
-
-function SaveIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M5 4h12l2 2v14H5zM8 4v6h8V4M8 20v-6h8v6" />
-    </svg>
-  );
-}
-
-function AudioIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M9 18V6l10-2v12M9 18c0 1.1-1.3 2-3 2s-3-.9-3-2 1.3-2 3-2 3 .9 3 2Zm10-2c0 1.1-1.3 2-3 2s-3-.9-3-2 1.3-2 3-2 3 .9 3 2ZM9 9l10-2" />
-    </svg>
-  );
 }
 
 function LinkIcon() {

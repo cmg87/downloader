@@ -1,4 +1,4 @@
-import { inspectMedia } from "@/lib/yt-dlp";
+import { errorKindOf, inspectMedia } from "@/lib/yt-dlp";
 import { validateMediaUrl } from "@/lib/url";
 
 export const runtime = "nodejs";
@@ -12,6 +12,6 @@ export async function POST(request: Request) {
     return Response.json(capabilities);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unable to inspect this URL.";
-    return Response.json({ error: message }, { status: 400 });
+    return Response.json({ error: message, errorKind: errorKindOf(error) }, { status: 400 });
   }
 }

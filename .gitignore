@@ -16,3 +16,17 @@ npm-debug.log*
 
 # typescript
 *.tsbuildinfo
+
+# runtime logs
+app.log
+
+# credentials — never commit cookie files (Netscape format or exported sessions)
+*.cookies.txt
+cookies*.txt
+/downloader-cookies/
+
+# Python runtime and optional local Instagram session folder
+__pycache__/
+*.pyc
+.venv/
+/instagram-session/
